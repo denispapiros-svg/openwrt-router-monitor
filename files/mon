@@ -1,0 +1,190 @@
+#!/bin/sh
+# OpenWrt router monitor: CGI-скрипт (http://ROUTER/cgi-bin/mon)
+CT=/proc/net/nf_conntrack
+LAN=$(ip -4 addr show br-lan 2>/dev/null | awk '/inet /{sub(/\/.*/,"",$2);print $2;exit}')
+LAN=${LAN:-192.168.1.1}
+PFX=${LAN%.*}.
+WD=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')
+WAN=$(ip -4 addr show "${WD:-wan}" 2>/dev/null | awk '/inet /{sub(/\/.*/,"",$2);print $2;exit}')
+a=$(echo "$QUERY_STRING" | sed -n 's/^a=\([a-z]*\).*/\1/p')
+ip=$(echo "$QUERY_STRING" | sed -n 's/.*ip=\([0-9.]*\).*/\1/p')
+
+# Одна строка статуса, считается почти без запуска процессов
+info() {
+  { read -r cnt < /proc/sys/net/netfilter/nf_conntrack_count; } 2>/dev/null
+  { read -r max < /proc/sys/net/netfilter/nf_conntrack_max; } 2>/dev/null
+  { read -r l1 l2 l3 _ < /proc/loadavg; } 2>/dev/null
+  { read -r up _ < /proc/uptime; } 2>/dev/null
+  up=${up%.*}
+  up=${up:-0}
+  mem=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
+  echo "WAN $WAN | up $((up/86400))d $((up%86400/3600))h $((up%3600/60))m | load $l1 $l2 $l3 | conntrack ${cnt:-?}/${max:-?} | RAM free ${mem:-?} MB"
+}
+
+# mode: all|router, $2 = IP клиента. Один проход awk по conntrack, без временных файлов.
+agg() {
+  awk -v mode="$1" -v ip="$2" -v w="$WAN" -v l="$LAN" '
+  { s=""; d=""; dp=""; st=($3=="tcp")?$6:"-"
+    for (i=1;i<=NF;i++) {
+      if (s==""  && $i ~ /^src=/)   s=substr($i,5)
+      else if (d==""  && $i ~ /^dst=/)   d=substr($i,5)
+      else if (dp=="" && $i ~ /^dport=/) dp=substr($i,7)
+    }
+    if (mode=="router") { if (s!=w && s!=l) next }
+    else if (ip!="" && s!=ip) next
+    c[$3" "st" "s" "d" "dp]++
+  }
+  END { for (k in c) print c[k], k }' $CT | sort -rn | head -150 | awk '
+  BEGIN { k=split("22 ssh 53 DNS 80 HTTP 123 NTP 443 HTTPS 853 DoT 8080 HTTP-alt 8443 HTTPS-alt 5228 Google-Push 3478 STUN 51820 WireGuard",m," ")
+          for (i=1;i<=k;i+=2) n[m[i]]=m[i+1]
+          while ((getline x < "/tmp/dhcp.leases") > 0) { split(x,y," "); nm[y[3]]=y[4] } }
+  { s=$4; if ((s in nm) && nm[s]!="*") s=s" ("nm[s]")"
+    printf "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td><span class=ip>%s</span></td><td>%s</td><td>%s</td></tr>\n",$1,$2,$3,s,$5,$6,(($6 in n)?n[$6]:"") }'
+}
+
+th() {
+  printf '<table><tr>'
+  for x in "$@"; do printf '<th>%s</th>' "$x"; done
+  echo '</tr>'
+}
+
+esc() { sed 's/&/\&amp;/g;s/</\&lt;/g'; }
+
+if [ -n "$a" ]; then
+printf 'Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nX-Info: %s\r\n\r\n' "$(info)"
+case "$a" in
+clients)
+  awk -v pfx="$PFX" -v lan="$LAN" 'BEGIN{while((getline x<"/tmp/dhcp.leases")>0){split(x,y," ");nm[y[3]]=y[4]}}
+  { s=""; for(i=1;i<=NF;i++) if($i~/^src=/){s=substr($i,5);break}
+    if (index(s,pfx)==1 && s!=lan) c[s]++ }
+  END { for (i in c) print i"|"((i in nm && nm[i]!="*")?nm[i]:i)"|"c[i] }' $CT | sort -t'|' -k3 -rn
+  ;;
+conn)
+  th "Кол-во" "Прото" "Сост." "Источник" "Назначение" "Порт" "Сервис"
+  agg all "$ip"
+  echo '</table>'
+  ;;
+router)
+  echo "<p class=n>Соединения самого роутера (источник = WAN $WAN или $LAN): sing-box/podkop, NTP, DNS, обновления.</p>"
+  th "Кол-во" "Прото" "Сост." "Мой IP" "Куда" "Порт" "Сервис"
+  agg router
+  echo '</table>'
+  ;;
+svc)
+  echo '<h3>Процессы и их соединения</h3>'
+  th "Процесс" "Прото" "Локальный" "Удалённый" "Состояние"
+  netstat -tunp 2>/dev/null | awk '$1~/^(tcp|udp)/{p=$NF;st=($1~/^tcp/)?$6:"-";if(p!~/\//)p="?";printf "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n",p,$1,$4,$5,st}' | sort
+  echo '</table><h3>Что слушает порты</h3>'
+  th "Процесс" "Прото" "Адрес:порт"
+  netstat -tulnp 2>/dev/null | awk '$1~/^(tcp|udp)/{if($1~/^tcp/&&$6!="LISTEN")next;p=$NF;if(p!~/\//)p="?";printf "<tr><td>%s</td><td>%s</td><td>%s</td></tr>\n",p,$1,$4}' | sort
+  echo '</table>'
+  ;;
+cl)
+  echo '<p class=n>Клик по строке — показать соединения этого устройства.</p>'
+  th "IP" "Имя" "MAC" "Соединений"
+  awk 'BEGIN{while((getline x<"/proc/net/nf_conntrack")>0){s="";n=split(x,f," ");for(i=1;i<=n;i++)if(f[i]~/^src=/){s=substr(f[i],5);break}c[s]++}}
+  { printf "%d %s %s %s\n", c[$3]+0, $3, $4, $2 }' /tmp/dhcp.leases | sort -rn | awk '{printf "<tr class=cr data-ip=\"%s\"><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n",$2,$2,$3,$4,$1}'
+  echo '</table>'
+  ;;
+log)
+  echo '<pre>'
+  logread | tail -80 | esc
+  echo '</pre>'
+  ;;
+pk)
+  echo "<p class=n>sing-box: $(pidof sing-box >/dev/null && echo работает || echo НЕ ЗАПУЩЕН)</p><pre>"
+  logread -e podkop | tail -50 | esc
+  echo '</pre>'
+  ;;
+esac
+exit 0
+fi
+
+printf 'Content-Type: text/html; charset=utf-8\r\n\r\n'
+cat <<'H'
+<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Router monitor</title><style>
+body{margin:0;background:#0f1115;color:#d7dae0;font:14px/1.4 system-ui,sans-serif}
+header{padding:10px 16px;background:#171a21;border-bottom:1px solid #262b36}
+#info{color:#7d8590;font-size:12px;margin-top:2px}
+nav,#cb{display:flex;gap:4px;padding:8px 16px;flex-wrap:wrap;align-items:center}
+#cb{padding-top:0}
+button{background:#1c212b;color:#b6bcc8;border:1px solid #2a3040;padding:6px 14px;border-radius:6px;cursor:pointer}
+button.on{background:#2f6feb;color:#fff;border-color:#2f6feb}
+#cb button{padding:4px 10px;font-size:13px;background:#161a22}
+#cb button.on{background:#238636;border-color:#238636}
+#cb small{color:#7d8590;margin-left:4px}
+#q{margin-left:auto;background:#1c212b;color:#d7dae0;border:1px solid #2a3040;border-radius:6px;padding:6px 10px}
+#sum{padding:0 16px 8px;display:flex;gap:10px;flex-wrap:wrap;font-size:13px}
+#sum span{background:#171c26;border-radius:5px;padding:2px 8px}
+#c{padding:0 16px 24px;overflow-x:auto}
+table{border-collapse:collapse;width:100%}
+th,td{text-align:left;padding:5px 10px;border-bottom:1px solid #1e2330;white-space:nowrap}
+th{color:#7d8590;font-weight:600;position:sticky;top:0;background:#0f1115}
+tr:hover td{background:#171c26}
+.cr{cursor:pointer}
+img.f{vertical-align:-2px;margin-right:6px;border-radius:2px}
+.tag{display:inline-block;min-width:16px;margin-right:6px;font-size:10px;color:#7d8590;border:1px solid #2a3040;border-radius:3px;padding:0 3px}
+h3{margin:18px 0 6px;color:#9fb4ff}.n{color:#7d8590}
+pre{font:12px/1.5 ui-monospace,monospace;white-space:pre-wrap;color:#c4c9d4}
+</style></head><body>
+<header><b>Router monitor</b><div id=info></div></header>
+<nav id=nav></nav><div id=cb></div><div id=sum></div><div id=c></div>
+<script>
+const T={conn:'Подключения',router:'Роутер',svc:'Сервисы',cl:'Клиенты',log:'Логи',pk:'Podkop'};
+let t=localStorage.t||'conn',sel='',last='',barAt=0,busy=false,gbusy=false,wait=0;
+if(!T[t])t='conn';
+const nav=document.getElementById('nav'),c=document.getElementById('c'),cb=document.getElementById('cb'),sum=document.getElementById('sum'),info=document.getElementById('info');
+let G={};try{G=JSON.parse(localStorage.geo||'{}');if(Object.keys(G).length>3000)G={}}catch(e){}
+for(const k in T){const b=document.createElement('button');b.textContent=T[k];b.id='b'+k;b.onclick=()=>{t=k;localStorage.t=k;last='';barAt=0;load()};nav.appendChild(b)}
+const q=document.createElement('input');q.id='q';q.placeholder='поиск (IP, порт, страна, процесс)';q.oninput=flt;nav.appendChild(q);
+function flt(){const v=q.value.toLowerCase();c.querySelectorAll('tr').forEach(r=>{if(r.querySelector('th'))return;r.style.display=r.textContent.toLowerCase().includes(v)?'':'none'})}
+const priv=ip=>/^(10\.|127\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|0\.|22[4-9]\.|2[3-5]\d\.)/.test(ip);
+const fake=ip=>/^198\.1[89]\./.test(ip);
+const flag=cc=>'<img class=f src="https://flagcdn.com/16x12/'+cc.toLowerCase()+'.png" width=16 height=12>';
+async function geo(){
+ const sp=[...c.querySelectorAll('.ip')];
+ if(!sp.length){sum.innerHTML='';return}
+ const need=[...new Set(sp.map(s=>s.textContent).filter(i=>!priv(i)&&!fake(i)&&!G[i]))].slice(0,100);
+ if(need.length&&!gbusy&&Date.now()>wait){gbusy=true;
+  try{const r=await fetch('http://ip-api.com/batch?fields=query,country,countryCode',{method:'POST',body:JSON.stringify(need)});
+   const j=await r.json();j.forEach(x=>{G[x.query]=[x.countryCode||'??',x.country||'?']});localStorage.geo=JSON.stringify(G)}
+  catch(e){wait=Date.now()+60000}
+  gbusy=false}
+ const cnt={};
+ sp.forEach(s=>{const i=s.textContent;let g=G[i];
+  if(fake(i))g=['fk','fake-ip (podkop)'];else if(priv(i))g=['lo','локальная сеть'];
+  if(!g)return;
+  s.title=g[1];
+  if(/^[A-Za-z]{2}$/.test(g[0])&&g[0]!='fk'&&g[0]!='lo'){s.insertAdjacentHTML('afterbegin',flag(g[0]));cnt[g[0]]=(cnt[g[0]]||0)+1}
+  else s.insertAdjacentHTML('afterbegin','<span class=tag>'+g[0]+'</span>');
+ });
+ sum.innerHTML=Object.entries(cnt).sort((a,b)=>b[1]-a[1]).map(e=>'<span>'+flag(e[0])+e[0]+' <b>'+e[1]+'</b></span>').join('');
+ flt();
+}
+async function bar(){
+ if(Date.now()-barAt<15000)return;
+ barAt=Date.now();
+ const L=(await (await fetch('?a=clients')).text()).trim().split('\n').filter(Boolean);
+ cb.innerHTML='';
+ const mk=(txt,ip,n)=>{const b=document.createElement('button');b.innerHTML=txt+(n?'<small>'+n+'</small>':'');b.className=sel==ip?'on':'';b.onclick=()=>{sel=ip;last='';barAt=0;load()};cb.appendChild(b)};
+ mk('Все','');
+ L.forEach(l=>{const p=l.split('|');mk(p[1]+(p[1]!=p[0]?' · '+p[0]:''),p[0],p[2])});
+}
+async function load(){
+ if(busy)return;busy=true;
+ for(const k in T)document.getElementById('b'+k).className=k==t?'on':'';
+ try{
+  const r=await fetch('?a='+t+'&ip='+sel);
+  const x=await r.text();
+  info.textContent=r.headers.get('X-Info')||'';
+  if(x!==last){last=x;c.innerHTML=x;
+   if(t=='cl')c.querySelectorAll('.cr').forEach(r=>r.onclick=()=>{sel=r.dataset.ip;t='conn';localStorage.t='conn';last='';barAt=0;load()});
+   flt();geo()}
+  if(t=='conn'){cb.style.display='flex';await bar()}else cb.style.display='none';
+ }catch(e){}
+ busy=false;
+}
+load();setInterval(()=>{if(!document.hidden)load()},5000);
+</script></body></html>
+H
