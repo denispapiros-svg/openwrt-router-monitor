@@ -13,10 +13,9 @@
 
 ## Установка
 
-По SSH на роутере (замени `USER/REPO` на свой репозиторий):
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/USER/REPO/main/install.sh | REPO=USER/REPO sh
+wget -qO- https://raw.githubusercontent.com/denispapiros-svg/openwrt-router-monitor/main/install.sh | REPO=denispapiros-svg/openwrt-router-monitor sh
 ```
 
 После установки открой `http://192.168.1.1/cgi-bin/mon` или в LuCI Services → Монитор (обнови страницу через Ctrl+F5).
@@ -24,7 +23,7 @@ wget -qO- https://raw.githubusercontent.com/USER/REPO/main/install.sh | REPO=USE
 Обновление: та же команда. Удаление:
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/USER/REPO/main/install.sh | REPO=USER/REPO sh -s uninstall
+wget -qO- https://raw.githubusercontent.com/denispapiros-svg/openwrt-router-monitor/main/install.sh | REPO=denispapiros-svg/openwrt-router-monitor sh -s uninstall
 ```
 
 Если `wget` ругается на https: `apk add ca-bundle libustream-mbedtls` (на старых версиях `opkg install ...`).
